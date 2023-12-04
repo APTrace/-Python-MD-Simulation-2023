@@ -1,0 +1,360 @@
+import numpy as np
+import numba as nb # Numba translates Python functions to optimized machine code at runtime
+from numba import jit
+import matplotlib.pylab as plt
+import time
+
+m= 1 #mass
+eps = 1
+sig = 1
+rc = 2.5
+
+#define system
+
+n_c = 4 # "FCC"  atoms per unit cell
+rho =0.95 #density
+T = 0.1  # variable temperature (constant for now)
+
+
+dt = 0.0025 # time step
+n_step = 100000 # nb of produced MD steps
+n_thermal = 10000 # nb of thermal steps
+n_log =1000 #freq of info dump
+n_dump = 10 # freq for configuration dump
+n_restat = 1000000 # restart file
+
+k_b = 1 #boltzman
+
+# we try to avoid units of 10^23 so we work without units
+
+u_e = eps # unit of energy
+u_l = sig # unit of length
+u_m = m # unit of mass
+u_t = np.sqrt(m*sig**2/eps) #energy = mass x distance^2 /time^2
+u_v= u_l/u_t #unit of volume
+u_f = u_m*u_l / u_t**2
+u_T= u_e /k_b # unit of temp E=k_b x T
+
+# now we define the nbr of particles
+N = 4*n_c**3 # fixed nb of particles for FCC it is 256
+L= (N/rho)**(1/3) # then fix the size of the box
+
+
+L/= u_l
+T/= u_T
+m/= u_m
+dt/= u_t
+rc /= u_l
+a= L/4 #length of unit cell
+
+#BELOW WE REDEFINING a FOR A TEST
+# a = 1.0
+
+
+#Precomputed weights for velocity and position increments, to later be multiplied by the force. This avoids unnecessary computation later.
+#Look up equations of motion
+
+w1 = 0.5 * dt / m
+w2= 0.5 * dt**2 / m
+
+#Defining r^6 to optimize calculation (maybe)
+
+#Why is it not just r6 = (1/r)**6 ???
+#@jit(nopython=True, nogil=True)
+def r6(r):
+
+  return (1/r**2)**3
+
+
+#r_c version
+r6r_c = (1/rc**2)**3
+
+
+#For the derivative of the Lennerd Jones Potential, will also need a function to precalculate (1/r), let call it r1
+#@jit(nopython=True, nogil=True)
+def r1(r):
+
+  return (1/r)
+
+
+#r_c version
+r1r_c = (1/rc)
+
+#Need 1/r^7 for the derivative of the full potential
+def r7(r):
+  return (1/r)**7
+
+#r_c version of r7
+r7r_c = (1/rc)**7
+
+# The base Lennerd-Jones Potential with r6 optimization and sigma = 1
+#@jit(nopython=True, nogil=True)
+def LJ_pot(r):
+
+  return 4 * eps * r6(r) * (r6(r) - 1)
+
+
+#Now that we have r1 and r6 we can define the deriative of the LJ Potential with them, it should be more computationally efficient
+#@jit(nopython=True, nogil=True)
+def diff_LJ_pot(r, e, s):
+  r66 = r6(r)
+  r11 = r1(r)
+  return 24 * e *r11 * r66 * (-2 * r66 - 1)
+
+
+#Potential as a function of r (unsure what to call it)
+#@jit(nopython=True, nogil=True)
+def pot(r, e, s):
+
+  return LJ_pot(r) - LJ_pot(rc) - (r - rc) * diff_LJ_pot(rc, e, s)
+
+
+#Derivative of the full potential
+def diff_pot(r, e, s):
+
+  return (rc-r)*((1/r7(r))*((2/r7(r))-(7/r)))
+
+
+
+#Flattened (1D) coordinates
+
+flat_coord = np.array([])
+
+print(flat_coord)
+
+#Returns the coordinates of the particles in one single FCC lattice
+
+#@jit(nopython=True, nogil=True)
+def fcc_lattice_coordinates(a):
+
+    # Basis vectors for FCC
+    basis = [
+        [0, 0, 0],
+        [0.5*a, 0.5*a, 0],
+        [0.5*a, 0, 0.5*a],
+        [0, 0.5*a, 0.5*a]
+    ]
+    return basis
+
+#This one dimensional coordinate storage is probably way less efficient than what the prof doesm but lets roll with it for now.
+
+
+#@jit(nopython=True, nogil=True)
+def fill_simulation_box(n_c, a, flat_coord):
+    """
+    Fill the simulation box with FCC lattices to reach the desired number of particles.
+    """
+    for x in range(n_c):
+        for y in range(n_c):
+            for z in range(n_c):
+                # Base coordinate for the current FCC cell
+                base_coord = [x*a, y*a, z*a]
+                # Compute the coordinates for all particles in the current FCC cell
+                for vec in fcc_lattice_coordinates(a):
+                    coord = [base + offset for base, offset in zip(base_coord, vec)]
+                    flat_coord = np.append(flat_coord, coord)
+    return flat_coord
+
+# Get the coordinates
+all_coordinates = fill_simulation_box(n_c, a, flat_coord)
+all_coordinates[:10]  # Display the first 10 coordinates for brevity
+
+print(all_coordinates.shape)
+
+# I can make the visualisation work if I reshape our coordinates to a 2D array, but idk if that's what you wanted.
+# Reshape the array to have 3 columns (x, y, z for each atom)
+
+reshaped_coordinates = all_coordinates.reshape(-1, 3)
+
+# Visualize the configuration
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+ax.scatter(reshaped_coordinates[:, 0], reshaped_coordinates[:, 1], reshaped_coordinates[:, 2], marker='o', s=50)
+ax.set_xlabel('X')
+ax.set_ylabel('Y')
+ax.set_zlabel('Z')
+ax.set_title('Final Particle Configuration')
+plt.show()
+
+
+# #PROFS VERSION, NOT FOR OUR USE
+# @jit(nopython=True, nogil=True)   # decorator related to Numba
+# def V_ij(r2, e, s):   # the Lennard Jones potential
+#     r6 = (s**2 / r2)**3
+#     return 4 * e * r6 * (r6 - 1)
+
+
+
+rc2 = rc**2
+
+
+
+def ene_vectorized(r, N, L, e, s, rc2):
+    # Reshape the r array for broadcasting: N x 1 x 3
+    r = r.reshape(N, 1, 3)
+
+    # Compute pairwise displacement: N x N x 3
+    dr = r - r.transpose(1, 0, 2)
+
+    # Apply minimum image convention
+    dr -= L * np.rint(dr / L)
+
+    # Compute squared distances, with shape N x N
+    r2 = np.sum(dr**2, axis=2)
+
+    # Apply cutoff radius and calculate potential energy
+    v = np.sum(np.where(r2 < rc2, pot(r2, e, s), 0))
+
+    # Divide by 2 because each interaction is counted ed twice
+    return v / 2
+
+
+v = ene_vectorized(reshaped_coordinates, N, L, eps, sig, rc2)
+print("N = ", N)
+print(v / N)
+
+
+# def forces_vectorized(r, N, L, e, s, rc2):
+#     r = r.reshape(N, 1, 3)
+#     dr = r - r.transpose(1, 0, 2)
+
+#     # Apply minimum image convention
+#     dr -= L * np.rint(dr / L)
+
+#     # Compute squared distances
+#     r2 = np.sum(dr**2, axis=2)
+
+#     # Initialize forces array
+#     F = np.zeros((N, 3))
+
+#     # Calculate forces only for pairs within the cutoff radius
+#     mask = (r2 < rc2) & (r2 > 0)
+#     dV = -diff_LJ_pot(r2[mask], e, s).reshape(mask.sum(), 1)
+#     F_contributions = dV * dr[mask]
+
+#     # Sum contributions to forces
+#     np.add.at(F, np.nonzero(mask)[0], F_contributions)
+#     np.add.at(F, np.nonzero(mask)[1], -F_contributions)
+
+#     # Calculate potential energy
+#     v = np.sum(np.where(mask, V_ij(r2, e, s), 0)) / 2
+
+#     # Check if sum of forces is close to zero
+#     total_force = np.sum(F, axis=0)
+#     force_sum_zero = np.allclose(total_force, np.zeros(3), atol=1e-6)
+
+#     return F, v, force_sum_zero
+
+# F, v, force_sum_zero = forces_vectorized(reshaped_coordinates, N, L, eps, sig, rc2)
+# print(v / N)
+# #print(F/N)
+# print("Sum of forces close to zero:", force_sum_zero)
+
+
+#
+#WE WERE USING THE WRING POTENTIAL, TRYING TO CHANGE TO USING FULL POT
+#
+
+
+def forces_vectorized(r, N, L, e, s, rc2):
+    r = r.reshape(N, 1, 3)
+    dr = r - r.transpose(1, 0, 2)
+
+    # Apply minimum image convention
+    dr -= L * np.rint(dr / L)
+
+    # Compute squared distances
+    r2 = np.sum(dr**2, axis=2)
+
+    # Initialize forces array
+    F = np.zeros((N, 3))
+
+    # Calculate forces only for pairs within the cutoff radius
+    mask = (r2 < rc2) & (r2 > 0)
+    dV = -diff_pot(r2[mask], e, s).reshape(mask.sum(), 1) #THIS HAS BEEN CHANGED TO THE DERIVATIVE OF THE FULL POTENTIAL
+    F_contributions = dV * dr[mask]
+
+    # Sum contributions to forces
+    np.add.at(F, np.nonzero(mask)[0], F_contributions)
+    np.add.at(F, np.nonzero(mask)[1], -F_contributions)
+
+    # Calculate potential energy
+    v = np.sum(np.where(mask, pot(r2, e, s), 0)) / 2
+
+    # Check if sum of forces is close to zero
+    total_force = np.sum(F, axis=0)
+    force_sum_zero = np.allclose(total_force, np.zeros(3), atol=1e-6)
+
+    return F, v, force_sum_zero
+
+F, v, force_sum_zero = forces_vectorized(reshaped_coordinates, N, L, eps, sig, rc2)
+print("Potential: ", v / N)
+#print(F/N)
+print("Sum of forces close to zero:", force_sum_zero)
+
+
+@jit(nopython=True, nogil=True)
+def K(v, m): # kinetic energy
+    return 0.5 * m * np.sum(v * v)
+
+@jit(nopython=True, nogil=True)
+def T_K(v, N, m): # istantaneous temperature
+    return 2 / 3 / N * K(v, m)
+
+@jit(nopython=True, nogil=True)
+def rescale_v(v, T, N, m): # velocity rescaling
+    return v * np.sqrt(T / T_K(v, N, m))
+
+@jit(nopython=True, nogil=True)
+def init_v(T, k_B, N, m): # random initial velocities
+    v  = 2 * np.random.rand(N, 3) - 1
+    v -= np.sum(v, axis = 0) / N # get rid of the center of mass velocity
+    return rescale_v(v, T, N, m) # rescale to the good temperature
+
+@jit(nopython=True, nogil=True)
+def calculate_observables(R, V, N, L, e, s, rc2, m):
+    pot = ene(R, N, L, e, s, rc2) / N
+    kin = K(V, m) / N
+    tot = pot + kin
+    tt  = T_K(V, N, m)
+    return pot, kin, tot, tt
+
+# velocity verlet algorithm
+@jit(nopython=True, nogil=True)
+def velocity_verlet_step(x_o, v_o, f_o, dt, vv1, vv2, N, L, e, s, rc2): # input are present x, v, f
+    x_n    = x_o + v_o * dt + w2 * f_o   # propagate x
+    f_n, _ = forces_nonvec(x_n, N, L, e, s, rc2) # calculate forces with new x (also get the potential energy)
+    v_n    = v_o + w1 * (f_o + f_n)      # propagate v
+    return x_n, v_n, f_n                  # output are new x, v, f
+
+# this is the MD trajectory
+
+t_run = time.time()
+
+ene_pot = []
+ene_kin = []
+ene_tot = []
+temp    = []
+
+# initialization...
+R    = reshaped_coordinates
+V    = init_v(T, k_b, N, m)
+F, _= forces_nonvec(R, N, L, eps, sig, rc2)
+print(R.shape)
+print(V.shape)
+print(F.shape)
+print("initialized everything at T=", T)
+
+for i in range(n_step):
+    R, V, F = velocity_verlet_step(R, V, F, dt, w1, w2, N, L, eps, sig, rc2)
+    if (i + 1) < n_thermal: V = rescale_v(V, T, N, m)
+    obs = calculate_observables(R, V, N, L, eps, sig, rc2, m)
+    pot = obs[0]
+    kin = obs[1]
+    tot = obs[2]
+    tt  = obs[3]
+    ene_pot.append(pot)
+    ene_kin.append(kin)
+    ene_tot.append(tot)
+    temp.append(tt)
+    if (i + 1) % n_log == 0: print("{:8d}{:15.9f}{:15.9f}{:15.9f}{:15.9f}{:15.9f}".format(i + 1, pot, kin, tot, tt, (time.time() - t_run) / 60))
